@@ -2,6 +2,7 @@
 """KDE Teleprompter — NotchPrompter-style for Linux/KDE Plasma."""
 
 import sys
+import signal
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSizeGrip, QDialog, QTextEdit,
@@ -565,11 +566,18 @@ class TeleprompterWindow(QMainWindow):
         self._adj_speed(delta)
         super().wheelEvent(event)
 
+    def closeEvent(self, event):
+        """Stop the timer and quit the application cleanly."""
+        self._timer.stop()
+        event.accept()
+        QApplication.quit()
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     app = QApplication(sys.argv)
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
     app.setApplicationName("KDE Teleprompter")
     app.setOrganizationName("NotchPrompter")
 
