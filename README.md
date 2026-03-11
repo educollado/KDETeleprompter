@@ -47,15 +47,28 @@ Built with **PyQt6** — no Electron, no browser, no bloat.
 
 ## Installation
 
+### Option 1 — .deb package (Debian / Ubuntu)
+
+Download the latest `.deb` from the [Releases](https://github.com/educollado/KDETeleprompter/releases/latest) page and install it:
+
+```bash
+sudo apt install ./kdeteleprompter_1.0.1_all.deb
+```
+
+This will automatically install the `python3-pyqt6` dependency if it is not already present.
+After installation, the app is available as `kdeteleprompter` from the terminal and from the KDE application launcher.
+
+### Option 2 — run from source
+
 ```bash
 # Clone or download the project
-cd teleprompter/
+cd kdeteleprompter/
 
 # Install the only dependency
 pip install -r requirements.txt
 
 # Run
-python kdeteleprompter.py
+python3 kdeteleprompter.py
 ```
 
 > **Tip (KDE):** Right-click the title bar → *More Actions → Keep Above Others* is not needed — the window sets this flag automatically.
