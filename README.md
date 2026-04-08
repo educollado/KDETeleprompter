@@ -26,6 +26,7 @@ Built with **PyQt6** — no Electron, no browser, no bloat.
 
 - **Always-on-top, frameless window** — sits above your video software
 - **Smooth 60 fps scroll** driven by a 16 ms QTimer
+- **Voice-activated scrolling** — scroll speed follows your speech energy in real time; pauses automatically when you stop talking
 - **Quadratic alpha fade** — lines near the centre are fully opaque; edges fade out gracefully
 - **Hover to pause** — moving the pointer over the window pauses scrolling and reveals controls
 - **Drag to reposition** anywhere on screen; **grip to resize**
@@ -38,10 +39,13 @@ Built with **PyQt6** — no Electron, no browser, no bloat.
 
 ## Requirements
 
-| Dependency | Version |
-|------------|---------|
-| Python     | ≥ 3.10  |
-| PyQt6      | ≥ 6.4.0 |
+| Dependency | Version | Notes |
+|------------|---------|-------|
+| Python     | ≥ 3.10  | |
+| PyQt6      | ≥ 6.4.0 | |
+| pyaudio    | ≥ 0.2.13 | Optional — required for voice-activated scroll |
+| numpy      | ≥ 1.24.0 | Optional — required for voice-activated scroll |
+| libportaudio2 | any | System library for pyaudio |
 
 ---
 
@@ -52,10 +56,10 @@ Built with **PyQt6** — no Electron, no browser, no bloat.
 Download the latest `.deb` from the [Releases](https://github.com/educollado/KDETeleprompter/releases/latest) page and install it:
 
 ```bash
-sudo apt install ./kdeteleprompter_1.0.1_all.deb
+sudo apt install ./kdeteleprompter_1.0.2_all.deb
 ```
 
-This will automatically install the `python3-pyqt6` dependency if it is not already present.
+This will automatically install `python3-pyqt6`, `python3-pyaudio`, `python3-numpy` and `libportaudio2` if not already present.
 After installation, the app is available as `kdeteleprompter` from the terminal and from the KDE application launcher.
 
 ### Option 2 — run from source
@@ -64,11 +68,11 @@ After installation, the app is available as `kdeteleprompter` from the terminal 
 # Clone or download the project
 cd kdeteleprompter/
 
-# Install the only dependency
-pip install -r requirements.txt
+# For voice-activated scroll, install the portaudio system library first:
+sudo apt install portaudio19-dev
 
-# Run
-python3 kdeteleprompter.py
+# Launch (creates a venv and installs dependencies automatically)
+./run.sh
 ```
 
 > **Tip (KDE):** Right-click the title bar → *More Actions → Keep Above Others* is not needed — the window sets this flag automatically.
@@ -81,6 +85,7 @@ python3 kdeteleprompter.py
 |-----|--------|
 | `Space` | Play / Pause |
 | `R` | Reset to beginning |
+| `M` | Toggle voice-activated scroll |
 | `+` / `=` | Increase speed |
 | `-` | Decrease speed |
 | `Ctrl+E` | Open script editor |
@@ -109,6 +114,7 @@ Appears automatically when the pointer enters the window.
 | ⏸ / ▶ button | — | Playing | Toggle pause |
 | ⏮ button | — | — | Reset scroll to top |
 | ✏ button | — | — | Open script editor |
+| 🎤 button | — | Off | Toggle voice-activated scroll |
 | Speed slider | 1 – 30 | 5 | Scroll speed (× 0.1 px/frame = 0.1 – 3.0 px/frame) |
 | Font slider | 10 – 72 pt | 28 pt | Display font size |
 | ✕ button | — | — | Close the application |
@@ -118,18 +124,22 @@ Appears automatically when the pointer enters the window.
 ## Project structure
 
 ```
-teleprompter/
-├── kdeteleprompter.py   # Single-file application (~320 lines)
-└── requirements.txt     # PyQt6>=6.4.0
+kdeteleprompter/
+├── kdeteleprompter.py   # Single-file application
+├── requirements.txt     # pyaudio, numpy
+├── run.sh               # launcher (creates venv automatically)
+└── build_deb.sh         # .deb packaging script
 ```
 
 ### Class overview
 
 ```
 TeleprompterWindow (QMainWindow)
-├── ScrollDisplay (QWidget)   — QPainter-based animated canvas
-├── ControlBar    (QWidget)   — hover-revealed control strip
-└── EditorDialog  (QDialog)   — script editor (modal)
+├── ScrollDisplay (QWidget)    — QPainter-based animated canvas
+├── ControlBar    (QWidget)    — hover-revealed control strip
+├── EditorDialog  (QDialog)    — script editor (modal)
+├── MicDialog     (QDialog)    — microphone selection
+└── VoiceListener (QThread)    — real-time VAD via pyaudio + numpy
 ```
 
 ---

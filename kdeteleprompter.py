@@ -6,13 +6,20 @@ import signal
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSizeGrip, QDialog, QTextEdit,
-    QFileDialog, QDialogButtonBox,
+    QFileDialog, QDialogButtonBox, QListWidget,
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtCore import Qt, QTimer, QPoint, QThread, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QLinearGradient,
     QPalette, QKeySequence, QShortcut,
 )
+
+try:
+    import pyaudio
+    import numpy as np
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
 
 # ── Colour palette (Catppuccin Mocha) ────────────────────────────────────────
 BG        = QColor(11, 11, 17)           # near-black background
@@ -38,6 +45,7 @@ Use the grip in the corner to resize.
 
 Space  — Play / Pause
 R      — Reset to beginning
+M      — Activar / desactivar scroll por voz
 Ctrl+E — Open text editor
 Escape — Close
 """
@@ -226,8 +234,8 @@ class ScrollDisplay(QWidget):
 class ControlBar(QWidget):
     """Semi-transparent control bar that appears when the user hovers the window.
 
-    Contains play/pause, reset, edit and close buttons, sliders for scroll speed
-    and font size, and a QSizeGrip for window resizing.
+    Contains play/pause, reset, edit, mic and close buttons, sliders for scroll
+    speed and font size, and a QSizeGrip for window resizing.
     """
 
     BAR_H = 54   # fixed height in pixels
@@ -256,6 +264,10 @@ class ControlBar(QWidget):
             }}
             QPushButton:pressed {{
                 background: rgba(203,166,247,120);
+            }}
+            QPushButton:disabled {{
+                color: rgba(203,166,247,40);
+                border-color: rgba(203,166,247,20);
             }}
             QLabel {{
                 color: #a6adc8;
@@ -287,11 +299,13 @@ class ControlBar(QWidget):
         self.btn_play  = self._btn("⏸", "Play / Pause  (Space)")
         self.btn_reset = self._btn("⏮", "Reset  (R)")
         self.btn_edit  = self._btn("✏", "Edit text  (Ctrl+E)")
+        self.btn_mic   = self._btn("🎤", "Activar scroll por voz  (M)")
         self.btn_close = self._btn("✕", "Close  (Escape)")
 
         layout.addWidget(self.btn_play)
         layout.addWidget(self.btn_reset)
         layout.addWidget(self.btn_edit)
+        layout.addWidget(self.btn_mic)
 
         layout.addSpacing(8)
 
@@ -406,6 +420,199 @@ class EditorDialog(QDialog):
                 self._editor.setPlainText(f.read())
 
 
+# ── Microphone selection dialog ───────────────────────────────────────────────
+
+class MicDialog(QDialog):
+    """Diálogo para seleccionar el dispositivo de entrada de audio."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Seleccionar micrófono")
+        self.setMinimumWidth(440)
+        self.setStyleSheet("""
+            QDialog { background: #1e1e2e; color: #cdd6f4; }
+            QListWidget {
+                background: #181825;
+                color: #cdd6f4;
+                border: 1px solid rgba(203,166,247,60);
+                border-radius: 6px;
+                font-size: 13px;
+                padding: 4px;
+            }
+            QListWidget::item { padding: 6px 4px; }
+            QListWidget::item:selected {
+                background: rgba(203,166,247,60);
+                color: #cdd6f4;
+            }
+            QLabel { color: #a6adc8; font-size: 12px; padding: 2px 0; }
+            QPushButton {
+                background: rgba(203,166,247,30);
+                color: #cba6f7;
+                border: 1px solid rgba(203,166,247,80);
+                border-radius: 6px;
+                padding: 4px 14px;
+            }
+            QPushButton:hover { background: rgba(203,166,247,70); }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("Elige el micrófono para el scroll por voz:"))
+
+        self._list = QListWidget()
+        layout.addWidget(self._list)
+
+        layout.addWidget(QLabel(
+            "Al confirmar se calibrará el ruido ambiente durante 2 segundos.\n"
+            "Mantén silencio durante la calibración."
+        ))
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._devices: list[tuple[int, str]] = []  # (pyaudio_index, name)
+        self._populate()
+
+    def _populate(self):
+        pa = VoiceListener._open_pa_quiet()
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                self._devices.append((i, info["name"]))
+                self._list.addItem(info["name"])
+        pa.terminate()
+        if self._list.count() > 0:
+            self._list.setCurrentRow(0)
+
+    def get_device_index(self) -> int | None:
+        """Índice pyaudio del dispositivo seleccionado, o None."""
+        row = self._list.currentRow()
+        if 0 <= row < len(self._devices):
+            return self._devices[row][0]
+        return None
+
+
+# ── Voice activity detection thread ──────────────────────────────────────────
+
+class VoiceListener(QThread):
+    """Hilo que captura audio del micrófono y emite señales de actividad vocal.
+
+    Fases:
+      1. Calibración (~2 s): mide el ruido ambiente para fijar el umbral.
+      2. Escucha: emite speaking_changed(True/False) con histéresis para evitar
+         cambios erráticos por sonidos breves o silencios momentáneos.
+    """
+
+    speed_hint       = pyqtSignal(float)  # 0.0 = silencio, >0 = multiplicador de velocidad
+    calibration_done = pyqtSignal()       # emitida al finalizar la calibración
+    error_occurred   = pyqtSignal(str)    # emitida si el stream falla
+
+    CHUNK         = 1024   # frames por buffer de audio
+    CAL_SECS      = 2      # segundos de calibración de ruido ambiente
+    NOISE_FACTOR  = 2.0    # umbral = ruido_base × NOISE_FACTOR
+    SMOOTH_ALPHA  = 0.4    # suavizado exponencial de la energía (0=lento, 1=instantáneo)
+    SILENCE_HOLD  = 6      # chunks de silencio antes de frenar (≈140 ms a 44100 Hz)
+
+    def __init__(self, device_index: int | None, parent=None):
+        super().__init__(parent)
+        self._device_index = device_index
+        self._running = False
+
+    def run(self):
+        try:
+            self._run_loop()
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+    @staticmethod
+    def _open_pa_quiet() -> "pyaudio.PyAudio":
+        """Abre PyAudio suprimiendo el spam de ALSA/JACK en stderr."""
+        import os
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_err = os.dup(2)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        try:
+            pa = pyaudio.PyAudio()
+        finally:
+            os.dup2(old_err, 2)
+            os.close(old_err)
+        return pa
+
+    def _run_loop(self):
+        pa = self._open_pa_quiet()
+
+        # Detectar la sample rate nativa del dispositivo
+        if self._device_index is not None:
+            info = pa.get_device_info_by_index(self._device_index)
+        else:
+            info = pa.get_default_input_device_info()
+        rate = int(info.get("defaultSampleRate", 44100))
+
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=rate,
+            input=True,
+            input_device_index=self._device_index,
+            frames_per_buffer=self.CHUNK,
+        )
+
+        # ── Fase 1: calibración ──────────────────────────────────────────────
+        cal_chunks = max(1, int(rate / self.CHUNK * self.CAL_SECS))
+        energies: list[float] = []
+        for _ in range(cal_chunks):
+            if not self._running:
+                break
+            raw = stream.read(self.CHUNK, exception_on_overflow=False)
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+            energies.append(float(np.sqrt(np.mean(audio ** 2))))
+
+        threshold = (np.mean(energies) if energies else 300.0) * self.NOISE_FACTOR
+        self.calibration_done.emit()
+
+        # ── Fase 2: escucha con velocidad proporcional a la energía ─────────
+        smooth_rms    = 0.0
+        silence_count = 0
+
+        while self._running:
+            raw = stream.read(self.CHUNK, exception_on_overflow=False)
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+
+            # Suavizado exponencial para evitar saltos bruscos
+            smooth_rms = self.SMOOTH_ALPHA * rms + (1 - self.SMOOTH_ALPHA) * smooth_rms
+
+            if smooth_rms > threshold:
+                silence_count = 0
+                # Multiplicador: 1.5 en el umbral, hasta 3.0 para voz fuerte
+                multiplier = min(3.0, (smooth_rms / threshold) * 1.5)
+                self.speed_hint.emit(multiplier)
+            else:
+                silence_count += 1
+                if silence_count >= self.SILENCE_HOLD:
+                    self.speed_hint.emit(0.0)
+
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+
+    def start_listening(self):
+        """Arranca el hilo de captura."""
+        self._running = True
+        self.start()
+
+    def stop_listening(self):
+        """Detiene el hilo y espera a que termine (máx. 2 s)."""
+        self._running = False
+        self.wait(2000)
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class TeleprompterWindow(QMainWindow):
@@ -425,6 +632,10 @@ class TeleprompterWindow(QMainWindow):
         self._paused   = False             # True when the user manually paused
         self._hovering = False             # True while the pointer is inside the window
         self._drag_pos: QPoint | None = None  # last recorded mouse position during drag
+
+        # Voice-control state
+        self._voice_listener: VoiceListener | None = None
+        self._voice_speed = 0.0   # multiplicador de velocidad recibido del hilo de audio
 
         # Remove the title bar and keep the window on top of everything.
         # Qt.WindowType.Tool hides the window from the taskbar.
@@ -461,9 +672,15 @@ class TeleprompterWindow(QMainWindow):
         self._bar.btn_play.clicked.connect(self._toggle_pause)
         self._bar.btn_reset.clicked.connect(self._reset)
         self._bar.btn_edit.clicked.connect(self._open_editor)
+        self._bar.btn_mic.clicked.connect(self._toggle_voice)
         self._bar.btn_close.clicked.connect(self.close)
         # Speed slider value is read each tick; no signal handler needed
         self._bar.sld_font.valueChanged.connect(self._display.set_font_size)
+
+        # Disable mic button if audio libraries are missing
+        if not AUDIO_AVAILABLE:
+            self._bar.btn_mic.setEnabled(False)
+            self._bar.btn_mic.setToolTip("Instala pyaudio y numpy para usar el micrófono")
 
         # 16 ms timer drives the scroll animation (~62.5 fps)
         self._timer = QTimer(self)
@@ -474,6 +691,7 @@ class TeleprompterWindow(QMainWindow):
         # Global keyboard shortcuts
         QShortcut(QKeySequence(Qt.Key.Key_Space),  self).activated.connect(self._toggle_pause)
         QShortcut(QKeySequence(Qt.Key.Key_R),       self).activated.connect(self._reset)
+        QShortcut(QKeySequence(Qt.Key.Key_M),       self).activated.connect(self._toggle_voice)
         QShortcut(QKeySequence(Qt.Key.Key_Plus),    self).activated.connect(lambda: self._adj_speed(+1))
         QShortcut(QKeySequence(Qt.Key.Key_Equal),   self).activated.connect(lambda: self._adj_speed(+1))
         QShortcut(QKeySequence(Qt.Key.Key_Minus),   self).activated.connect(lambda: self._adj_speed(-1))
@@ -495,11 +713,20 @@ class TeleprompterWindow(QMainWindow):
 
         Advances the scroll by speed px unless paused or the pointer is
         hovering (hover also acts as a temporary pause).
+
+        When voice control is active, scrolling is additionally gated on
+        whether speech is currently detected.
         """
-        if not self._paused and not self._hovering:
-            # slider range 1–30 → 0.1–3.0 px per frame
-            speed = self._bar.sld_speed.value() * 0.1
-            self._display.advance(speed)
+        if self._paused or self._hovering:
+            return
+        base_speed = self._bar.sld_speed.value() * 0.1
+        if self._voice_listener is not None:
+            if self._voice_speed < 0.05:
+                return  # silencio — no avanzar
+            speed = base_speed * self._voice_speed
+        else:
+            speed = base_speed
+        self._display.advance(speed)
 
     # ── Control-bar slots ─────────────────────────────────────────────────────
 
@@ -522,6 +749,55 @@ class TeleprompterWindow(QMainWindow):
         dlg = EditorDialog(self._display._text, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._display.set_text(dlg.get_text())
+
+    # ── Voice control ─────────────────────────────────────────────────────────
+
+    def _toggle_voice(self):
+        """Activa o desactiva el scroll controlado por voz."""
+        if not AUDIO_AVAILABLE:
+            return
+
+        if self._voice_listener is not None:
+            # Detener el control por voz
+            self._voice_listener.stop_listening()
+            self._voice_listener = None
+            self._voice_speed = 0.0
+            self._bar.btn_mic.setText("🎤")
+            self._bar.btn_mic.setToolTip("Activar scroll por voz  (M)")
+            return
+
+        # Mostrar diálogo de selección de micrófono
+        dlg = MicDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        device_index = dlg.get_device_index()
+
+        listener = VoiceListener(device_index, self)
+        listener.speed_hint.connect(self._on_speed_hint)
+        listener.calibration_done.connect(self._on_calibration_done)
+        listener.error_occurred.connect(self._on_voice_error)
+        listener.start_listening()
+
+        self._voice_listener = listener
+        self._bar.btn_mic.setText("⏳")
+        self._bar.btn_mic.setToolTip("Calibrando ruido ambiente…")
+
+    def _on_speed_hint(self, multiplier: float):
+        """Recibe el multiplicador de velocidad del hilo de audio."""
+        self._voice_speed = multiplier
+
+    def _on_calibration_done(self):
+        """Actualiza el botón cuando la calibración ha finalizado."""
+        self._bar.btn_mic.setText("🔊")
+        self._bar.btn_mic.setToolTip("Scroll por voz activo — clic para desactivar  (M)")
+
+    def _on_voice_error(self, msg: str):
+        """Resetea el estado del micrófono si el stream falla."""
+        self._voice_listener = None
+        self._voice_speed = 0.0
+        self._bar.btn_mic.setText("🎤")
+        self._bar.btn_mic.setToolTip(f"Error de micrófono: {msg}\nClic para reintentar  (M)")
 
     # ── Hover detection ───────────────────────────────────────────────────────
 
@@ -567,8 +843,10 @@ class TeleprompterWindow(QMainWindow):
         super().wheelEvent(event)
 
     def closeEvent(self, event):
-        """Stop the timer and quit the application cleanly."""
+        """Stop the timer, stop the voice listener, and quit cleanly."""
         self._timer.stop()
+        if self._voice_listener is not None:
+            self._voice_listener.stop_listening()
         event.accept()
         QApplication.quit()
 

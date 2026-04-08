@@ -2,7 +2,7 @@
 set -e
 
 PKG="kdeteleprompter"
-VERSION="1.0.1"
+VERSION="1.0.2"
 ARCH="all"
 BUILD_DIR="${PKG}_${VERSION}_${ARCH}"
 DEB="${BUILD_DIR}.deb"
@@ -24,7 +24,7 @@ Package: $PKG
 Version: $VERSION
 Architecture: $ARCH
 Maintainer: Eduardo Collado
-Depends: python3 (>= 3.10), python3-pyqt6
+Depends: python3 (>= 3.10), python3-pyqt6, python3-pyaudio, python3-numpy, libportaudio2
 Section: utils
 Priority: optional
 Description: Frameless teleprompter for KDE Plasma
@@ -32,7 +32,8 @@ Description: Frameless teleprompter for KDE Plasma
  Built with PyQt6 — no Electron, no browser, no bloat.
  .
  Features smooth 60 fps scrolling, hover-revealed controls, drag to move,
- script editor with file-load support, and a Catppuccin Mocha colour scheme.
+ script editor with file-load support, voice-activated scrolling via microphone,
+ and a Catppuccin Mocha colour scheme.
 EOF
 
 # Application script
